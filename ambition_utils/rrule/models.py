@@ -1,21 +1,28 @@
-import copy
-from datetime import datetime
-
-import pytz
-from dateutil.rrule import rrule
+from __future__ import annotations
+from datetime import datetime, timedelta
 from dateutil import parser
+from dateutil.rrule import rrule
+from django.contrib.contenttypes.fields import GenericForeignKey
+from django.contrib.contenttypes.models import ContentType
 from django.contrib.postgres.fields import JSONField
 from django.db import models, transaction
 from django.utils.module_loading import import_string
 from fleming import fleming
 from manager_utils import bulk_update
 from timezone_field import TimeZoneField
+from typing import List
+import copy
+import pytz
+import logging
+
+LOG = logging.getLogger(__name__)
 
 
 class RRuleManager(models.Manager):
     """
     Custom manager for rrule objects
     """
+
     def update_next_occurrences(self, rrule_objects=None):
         if rrule_objects is None:
             return
@@ -24,14 +31,23 @@ class RRuleManager(models.Manager):
 
         bulk_update(self, rrule_objects, ['last_occurrence', 'next_occurrence'])
 
+        return rrule_objects
+
     @transaction.atomic
-    def handle_overdue(self, **filters):
+    def handle_overdue(self, **kwargs):
         """
         Handles any overdue rrules
+        :param kwargs: the old optional kwarg filters for specifying additional occurrence handler filters
         """
+        self.process_occurrence_handler_paths(**kwargs)
+        self.process_related_model_handlers()
 
+    def process_occurrence_handler_paths(self, **kwargs):
+        """
+        This is the old style of processing overdue rrules
+        """
         # Get instances of all overdue recurrence handler classes
-        instances = self.overdue_handler_class_instances(**filters)
+        instances = self.overdue_handler_class_instances(**kwargs)
 
         # Build a list of rrules that get returned from the handler
         rrules = []
@@ -41,7 +57,29 @@ class RRuleManager(models.Manager):
         # Bulk update the next occurrences
         RRule.objects.update_next_occurrences(rrule_objects=rrules)
 
-    def overdue_handler_class_instances(self, **filters):
+    def process_related_model_handlers(self):
+        # Get the rrule objects that are overdue and need to be handled
+        rrule_objects = self.get_queryset().filter(
+            next_occurrence__lte=datetime.utcnow(),
+            related_object_handler_name__isnull=False,
+            related_object_id__isnull=False,
+        ).prefetch_related('related_object')
+
+        rrules_to_advance = []
+        for rrule_object in rrule_objects:
+            if hasattr(rrule_object.related_object, rrule_object.related_object_handler_name):
+                rrules_to_advance.append(
+                    getattr(rrule_object.related_object, rrule_object.related_object_handler_name)(rrule_object)
+                )
+
+        rrules_to_advance = [rrule_to_advance for rrule_to_advance in rrules_to_advance if rrule_to_advance]
+
+        # Bulk update the next occurrences
+        rrules_to_advance = RRule.objects.update_next_occurrences(rrule_objects=rrules_to_advance)
+
+        return rrules_to_advance
+
+    def overdue_handler_class_instances(self, **kwargs):
         """
         Returns a set of instances for any handler with an old next_occurrence
         """
@@ -49,16 +87,18 @@ class RRuleManager(models.Manager):
         # Get the rrule objects that are overdue and need to be handled
         rrule_objects = self.get_queryset().filter(
             next_occurrence__lte=datetime.utcnow(),
-            **filters
+            **kwargs
         ).distinct(
             'occurrence_handler_path'
         )
 
         # Return instances of the handler classes
-        return [
+        handler_classes = [
             rrule_object.get_occurrence_handler_class_instance()
             for rrule_object in rrule_objects
         ]
+        handler_classes = [handler_class for handler_class in handler_classes if handler_class]
+        return handler_classes
 
 
 class RRule(models.Model):
@@ -85,6 +125,14 @@ class RRule(models.Model):
     # The configuration class must extend ambition_utils.rrule.handler.OccurrenceHandler
     occurrence_handler_path = models.CharField(max_length=500, blank=False, null=False)
 
+    # Generic relation back to object to explicitly call expiration methods
+    related_object_id = models.IntegerField(null=True, db_index=True)
+    related_object_content_type = models.ForeignKey(ContentType, null=True, on_delete=models.PROTECT)
+    related_object = GenericForeignKey('related_object_content_type', 'related_object_id')
+
+    # The name of the method to call on the related_object when the recurrence has expired
+    related_object_handler_name = models.TextField(default=None, null=True, blank=True)
+
     # Custom object manager
     objects = RRuleManager()
 
@@ -104,7 +152,11 @@ class RRule(models.Model):
         :rtype: ambition_utils.rrule.handler.OccurrenceHandler
         :return: The instance
         """
-        return import_string(self.occurrence_handler_path)()
+        try:
+            handler_class = import_string(self.occurrence_handler_path)()
+            return handler_class
+        except:
+            return None
 
     def get_rrule(self):
         """
@@ -266,9 +318,12 @@ class RRule(models.Model):
         # Call the parent save method
         super().save(*args, **kwargs)
 
-    def generate_dates(self, num_dates=20):
+    def get_dates(self, num_dates=20, start_date=None) -> List[datetime]:
         """
-        Generate the first num_dates dates of the recurrence and return a list of datetimes
+        Return a list of datetime objects the recurrence will generate, after the start date (if defined).
+        :param num_dates: The maximum number of dates to calculate. Will stop at passed start_date
+        :param start_date: The optional start date to begin generating dates after
+        :return: A list of datetime objects
         """
         assert num_dates > 0
 
@@ -276,31 +331,103 @@ class RRule(models.Model):
 
         dates = []
 
-        rule = self.get_rrule()
-
         try:
-            d = rule[0]
-            # Convert to time zone
-            date_with_tz = fleming.attach_tz_if_none(d, self.time_zone)
-            date_in_utc = fleming.convert_to_tz(date_with_tz, pytz.utc, True)
-            dates.append(date_in_utc)
+            # Capture the rule's first date for use in RRule.after() in the loop.
+            rule = self.get_rrule()
 
-            for x in range(0, num_dates):
-                d = rule.after(d)
-                if not d:
+            # Evaluate if the first date should be retained.
+            d = self.convert_to_utc(rule[0])
+            if not start_date or d > start_date:
+                dates.append(d)
+
+            # Continue evaluating and appending dates to satisfy desired number,
+            # retaining date for evaluation in the next iteration.
+            while len(dates) < num_dates:
+                d = self.get_next_occurrence(last_occurrence=d)
+                if d:
+                    if not start_date or d > start_date:
+                        dates.append(d)
+                else:
                     break
-                # Convert to time zone
-                date_with_tz = fleming.attach_tz_if_none(d, self.time_zone)
-                date_in_utc = fleming.convert_to_tz(date_with_tz, pytz.utc, True)
-                dates.append(date_in_utc)
+
         except Exception:  # pragma: no cover
             pass
 
         return dates
 
+    def generate_dates(self, num_dates=20):
+        """
+        DEPRECATED. Replaced by get_dates.
+        Return a list of the next num_dates datetimes of the recurrence.
+        """
+        LOG.warning('generate_dates has been replaced by get_dates and will be removed in version 3.x.')
+        return self.get_dates(num_dates)
+
+    def clone(self) -> RRule:
+        """
+        Creates a clone of itself.
+        """
+
+        # Clear id to force a new object.
+        clone = copy.deepcopy(self)
+        clone.id = None
+
+        clone.save()
+
+        return clone
+
+    def clone_with_day_offset(self, day_offset: int) -> RRule:
+        """
+        Creates a clone of a passed RRule object offset by a specified number of days
+        :param day_offset: The number of days to offset the clone's start date. Can be negative.
+        """
+
+        # Create a clone of itself
+        clone = self.clone()
+
+        # Manually update the rrule.dtstart & next_occurrence with the offset.
+        clone.rrule_params['dtstart'] = parser.parse(clone.rrule_params['dtstart']) + timedelta(days=day_offset)
+        clone.next_occurrence = clone.next_occurrence + timedelta(days=day_offset)
+
+        # Update until param by offsetting if it exists
+        if 'until' in clone.rrule_params:
+            clone.rrule_params['until'] = parser.parse(clone.rrule_params['until']) + timedelta(days=day_offset)
+
+        def offset_day(day: int) -> int:
+            """
+            Calculates the representation of a given day of the week plus the provided offset
+            For example, Tuesday (1) - 3 days yields Saturday (5).
+            :param int day: 0-6 that corresponds to RRule's weekday constants, MO-SU.
+            """
+            return (7 + (day + day_offset)) % 7
+
+        # Update byweekday param by offsetting. byweekday can be an array or integer.
+        if 'byweekday' in clone.rrule_params:
+            if isinstance(clone.rrule_params['byweekday'], list):
+                clone.rrule_params['byweekday'] = [
+                    offset_day(day) for day in clone.rrule_params['byweekday']
+                ]
+            else:
+                clone.rrule_params['byweekday'] = offset_day(clone.rrule_params['byweekday'])
+
+        # Lock it.
+        clone.save()
+
+        return clone
+
     @classmethod
-    def generate_dates_from_params(cls, rrule_params, time_zone=None, num_dates=20):
+    def get_dates_from_params(cls, rrule_params, time_zone=None, num_dates=20, start_date=None):
         time_zone = time_zone or pytz.utc
         rule = cls(rrule_params=rrule_params, time_zone=time_zone)
 
-        return rule.generate_dates(num_dates=num_dates)
+        return rule.get_dates(num_dates=num_dates, start_date=start_date)
+
+    @classmethod
+    def generate_dates_from_params(cls, rrule_params, time_zone=None, num_dates=20):
+        """
+        DEPRECATED. Replaced by get_dates_from_params.
+        """
+        LOG.warning(
+            'generate_dates_from_params has been replaced by get_dates_from_params and will be removed in version 3.x.'
+        )
+        return cls.get_dates_from_params(rrule_params, time_zone, num_dates)

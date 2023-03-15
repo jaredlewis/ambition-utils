@@ -1,5 +1,53 @@
+
 Release Notes
 =============
+
+3.1.0
+-----
+* Restore future version support and drop forked timezone field
+
+3.0.1
+-----
+* Restore forked timezone field for now. will be removed in 3.1
+* Only support py 3.7 and django 2.2, 3.2. other versions will be restored in 3.1
+
+3.0.0
+-----
+* Add support for python 3.8, 3.9
+* Drop support for python 3.6
+* Add support for Django 3.0, 3.1, 3.2, 4.0, 4.1
+* Drop support for django 2.0, 2.1
+* Switch to github actions
+* Switched from ambition timezone field package to the main timezone field and set the requirement to < 5
+* Added the cast-on-assignment behavior to this project as a mixin for models
+* Added a subclass of timezone field which uses the cast-on-assign behavior
+
+2.6.0
+-----
+* Added get_dates(start_date=) to calculate dates after start_date. Will replace get_dates.
+* Added get_dates_from_params(start_date=) to calculate dates after start_date from rrule_params. Will replace generate_dates_from_params.
+
+2.5.3
+-----
+* Fixed cloning when until param is present
+
+2.5.2
+-----
+* Fixed cloning with bynweekday data
+
+2.5.1
+-----
+* Updated the get_time_zone() helper method with pytz.all_timezones
+
+2.5.0
+-----
+* Added support for byminute
+
+2.4.0
+-----
+* Added rrule related object relation and object-level handling
+* Added rrule clone_with_day_offset method
+* Added rrule clone method
 
 2.3.0
 -----
